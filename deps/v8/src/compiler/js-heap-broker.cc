@@ -14,6 +14,7 @@
 #include "src/api/api-inl.h"
 #include "src/ast/modules.h"
 #include "src/codegen/code-factory.h"
+#include "src/codegen/optimized-compilation-info.h"
 #include "src/compiler/access-info.h"
 #include "src/compiler/bytecode-analysis.h"
 #include "src/compiler/graph-reducer.h"
@@ -44,7 +45,10 @@ namespace compiler {
 #define TRACE_MISSING(broker, x) TRACE_BROKER_MISSING(broker, x)
 
 #define FORWARD_DECL(Name) class Name##Data;
-HEAP_BROKER_OBJECT_LIST(FORWARD_DECL)
+HEAP_BROKER_SERIALIZED_OBJECT_LIST(FORWARD_DECL)
+// TODO(solanes, v8:10866): Remove once FLAG_turbo_direct_heap_access is
+// removed.
+HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(FORWARD_DECL)
 #undef FORWARD_DECL
 
 // There are three kinds of ObjectData values.
@@ -70,6 +74,7 @@ enum ObjectDataKind {
   kSmi,
   kSerializedHeapObject,
   kUnserializedHeapObject,
+  kNeverSerializedHeapObject,
   kUnserializedReadOnlyHeapObject
 };
 
@@ -78,7 +83,8 @@ class AllowHandleAllocationIf {
   explicit AllowHandleAllocationIf(ObjectDataKind kind,
                                    JSHeapBroker::BrokerMode mode) {
     DCHECK_IMPLIES(mode == JSHeapBroker::BrokerMode::kSerialized,
-                   kind == kUnserializedReadOnlyHeapObject);
+                   kind == kUnserializedReadOnlyHeapObject ||
+                       kind == kNeverSerializedHeapObject);
     if (kind == kUnserializedHeapObject) maybe_allow_handle_.emplace();
   }
 
@@ -89,16 +95,15 @@ class AllowHandleAllocationIf {
 class AllowHandleDereferenceIf {
  public:
   explicit AllowHandleDereferenceIf(ObjectDataKind kind,
-                                    JSHeapBroker::BrokerMode mode) {
+                                    JSHeapBroker::BrokerMode mode)
+      : AllowHandleDereferenceIf(kind) {
     DCHECK_IMPLIES(mode == JSHeapBroker::BrokerMode::kSerialized,
-                   kind == kUnserializedReadOnlyHeapObject);
-    if (kind == kUnserializedHeapObject ||
-        kind == kUnserializedReadOnlyHeapObject)
-      maybe_allow_handle_.emplace();
+                   kind == kUnserializedReadOnlyHeapObject ||
+                       kind == kNeverSerializedHeapObject);
   }
 
   explicit AllowHandleDereferenceIf(ObjectDataKind kind) {
-    if (kind == kUnserializedHeapObject ||
+    if (kind == kUnserializedHeapObject || kind == kNeverSerializedHeapObject ||
         kind == kUnserializedReadOnlyHeapObject)
       maybe_allow_handle_.emplace();
   }
@@ -153,20 +158,29 @@ class ObjectData : public ZoneObject {
             broker->mode() == JSHeapBroker::kSerializing,
         broker->isolate()->handle_scope_data()->canonical_scope != nullptr);
     CHECK_IMPLIES(broker->mode() == JSHeapBroker::kSerialized,
-                  IsReadOnlyHeapObject(*object));
+                  (kind == kUnserializedReadOnlyHeapObject &&
+                   IsReadOnlyHeapObject(*object)) ||
+                      kind == kNeverSerializedHeapObject);
   }
 
-#define DECLARE_IS_AND_AS(Name) \
-  bool Is##Name() const;        \
-  Name##Data* As##Name();
-  HEAP_BROKER_OBJECT_LIST(DECLARE_IS_AND_AS)
-#undef DECLARE_IS_AND_AS
+#define DECLARE_IS(Name) bool Is##Name() const;
+  HEAP_BROKER_SERIALIZED_OBJECT_LIST(DECLARE_IS)
+  HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DECLARE_IS)
+#undef DECLARE_IS
+
+#define DECLARE_AS(Name) Name##Data* As##Name();
+  HEAP_BROKER_SERIALIZED_OBJECT_LIST(DECLARE_AS)
+  // TODO(solanes, v8:10866): Remove once FLAG_turbo_direct_heap_access is
+  // removed.
+  HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DECLARE_AS)
+#undef DECLARE_AS
 
   Handle<Object> object() const { return object_; }
   ObjectDataKind kind() const { return kind_; }
   bool is_smi() const { return kind_ == kSmi; }
   bool should_access_heap() const {
     return kind_ == kUnserializedHeapObject ||
+           kind_ == kNeverSerializedHeapObject ||
            kind_ == kUnserializedReadOnlyHeapObject;
   }
 
@@ -280,6 +294,11 @@ CallHandlerInfoData::CallHandlerInfoData(JSHeapBroker* broker,
                                          Handle<CallHandlerInfo> object)
     : HeapObjectData(broker, storage, object),
       callback_(v8::ToCData<Address>(object->callback())) {}
+
+// These definitions are here in order to please the linker, which in debug mode
+// sometimes requires static constants to be defined in .cc files.
+const uint32_t JSHeapBroker::kMinimalRefsBucketCount;
+const uint32_t JSHeapBroker::kInitialRefsBucketCount;
 
 void JSHeapBroker::IncrementTracingIndentation() { ++trace_indentation_; }
 
@@ -610,7 +629,7 @@ class JSFunctionData : public JSObjectData {
   bool has_feedback_vector() const { return has_feedback_vector_; }
   bool has_initial_map() const { return has_initial_map_; }
   bool has_prototype() const { return has_prototype_; }
-  bool IsOptimized() const { return is_optimized_; }
+  bool HasAttachedOptimizedCode() const { return has_attached_optimized_code_; }
   bool PrototypeRequiresRuntimeLookup() const {
     return PrototypeRequiresRuntimeLookup_;
   }
@@ -634,7 +653,7 @@ class JSFunctionData : public JSObjectData {
   bool has_feedback_vector_;
   bool has_initial_map_;
   bool has_prototype_;
-  bool is_optimized_;
+  bool has_attached_optimized_code_;
   bool PrototypeRequiresRuntimeLookup_;
 
   bool serialized_ = false;
@@ -1265,7 +1284,7 @@ JSFunctionData::JSFunctionData(JSHeapBroker* broker, ObjectData** storage,
       has_initial_map_(object->has_prototype_slot() &&
                        object->has_initial_map()),
       has_prototype_(object->has_prototype_slot() && object->has_prototype()),
-      is_optimized_(object->IsOptimized()),
+      has_attached_optimized_code_(object->HasAttachedOptimizedCode()),
       PrototypeRequiresRuntimeLookup_(
           object->PrototypeRequiresRuntimeLookup()) {}
 
@@ -1567,15 +1586,6 @@ class BytecodeArrayData : public FixedArrayBaseData {
     return incoming_new_target_or_generator_register_;
   }
 
-  uint8_t get(int index) const {
-    DCHECK(is_serialized_for_compilation_);
-    return bytecodes_[index];
-  }
-
-  Address GetFirstBytecodeAddress() const {
-    return reinterpret_cast<Address>(bytecodes_.data());
-  }
-
   Handle<Object> GetConstantAtIndex(int index, Isolate* isolate) const {
     return constant_pool_[index]->object();
   }
@@ -1591,54 +1601,18 @@ class BytecodeArrayData : public FixedArrayBaseData {
   void SerializeForCompilation(JSHeapBroker* broker) {
     if (is_serialized_for_compilation_) return;
 
-    Handle<BytecodeArray> bytecode_array =
-        Handle<BytecodeArray>::cast(object());
-
-    DCHECK(bytecodes_.empty());
-    bytecodes_.reserve(bytecode_array->length());
-    for (int i = 0; i < bytecode_array->length(); i++) {
-      bytecodes_.push_back(bytecode_array->get(i));
-    }
+    // Convinience cast: object() is already a canonical persistent handle.
+    Handle<BytecodeArray> bytecodes = Handle<BytecodeArray>::cast(object());
 
     DCHECK(constant_pool_.empty());
-    Handle<FixedArray> constant_pool(bytecode_array->constant_pool(),
+    Handle<FixedArray> constant_pool(bytecodes->constant_pool(),
                                      broker->isolate());
     constant_pool_.reserve(constant_pool->length());
     for (int i = 0; i < constant_pool->length(); i++) {
       constant_pool_.push_back(broker->GetOrCreateData(constant_pool->get(i)));
     }
 
-    Handle<ByteArray> source_position_table(
-        bytecode_array->SourcePositionTableIfCollected(), broker->isolate());
-    source_positions_.reserve(source_position_table->length());
-    for (int i = 0; i < source_position_table->length(); i++) {
-      source_positions_.push_back(source_position_table->get(i));
-    }
-
-    Handle<ByteArray> handlers(bytecode_array->handler_table(),
-                               broker->isolate());
-    handler_table_.reserve(handlers->length());
-    for (int i = 0; i < handlers->length(); i++) {
-      handler_table_.push_back(handlers->get(i));
-    }
-
     is_serialized_for_compilation_ = true;
-  }
-
-  const byte* source_positions_address() const {
-    return source_positions_.data();
-  }
-
-  size_t source_positions_size() const { return source_positions_.size(); }
-
-  Address handler_table_address() const {
-    CHECK(is_serialized_for_compilation_);
-    return reinterpret_cast<Address>(handler_table_.data());
-  }
-
-  int handler_table_size() const {
-    CHECK(is_serialized_for_compilation_);
-    return static_cast<int>(handler_table_.size());
   }
 
   BytecodeArrayData(JSHeapBroker* broker, ObjectData** storage,
@@ -1648,9 +1622,6 @@ class BytecodeArrayData : public FixedArrayBaseData {
         parameter_count_(object->parameter_count()),
         incoming_new_target_or_generator_register_(
             object->incoming_new_target_or_generator_register()),
-        bytecodes_(broker->zone()),
-        source_positions_(broker->zone()),
-        handler_table_(broker->zone()),
         constant_pool_(broker->zone()) {}
 
  private:
@@ -1659,9 +1630,6 @@ class BytecodeArrayData : public FixedArrayBaseData {
   interpreter::Register const incoming_new_target_or_generator_register_;
 
   bool is_serialized_for_compilation_ = false;
-  ZoneVector<uint8_t> bytecodes_;
-  ZoneVector<uint8_t> source_positions_;
-  ZoneVector<uint8_t> handler_table_;
   ZoneVector<ObjectData*> constant_pool_;
 };
 
@@ -1855,11 +1823,13 @@ class SourceTextModuleData : public HeapObjectData {
   void Serialize(JSHeapBroker* broker);
 
   CellData* GetCell(JSHeapBroker* broker, int cell_index) const;
+  ObjectData* GetImportMeta(JSHeapBroker* broker) const;
 
  private:
   bool serialized_ = false;
   ZoneVector<CellData*> imports_;
   ZoneVector<CellData*> exports_;
+  ObjectData* import_meta_;
 };
 
 SourceTextModuleData::SourceTextModuleData(JSHeapBroker* broker,
@@ -1867,7 +1837,8 @@ SourceTextModuleData::SourceTextModuleData(JSHeapBroker* broker,
                                            Handle<SourceTextModule> object)
     : HeapObjectData(broker, storage, object),
       imports_(broker->zone()),
-      exports_(broker->zone()) {}
+      exports_(broker->zone()),
+      import_meta_(nullptr) {}
 
 CellData* SourceTextModuleData::GetCell(JSHeapBroker* broker,
                                         int cell_index) const {
@@ -1890,6 +1861,11 @@ CellData* SourceTextModuleData::GetCell(JSHeapBroker* broker,
   }
   CHECK_NOT_NULL(cell);
   return cell;
+}
+
+ObjectData* SourceTextModuleData::GetImportMeta(JSHeapBroker* broker) const {
+  CHECK(serialized_);
+  return import_meta_;
 }
 
 void SourceTextModuleData::Serialize(JSHeapBroker* broker) {
@@ -1919,6 +1895,10 @@ void SourceTextModuleData::Serialize(JSHeapBroker* broker) {
     exports_.push_back(broker->GetOrCreateData(exports->get(i))->AsCell());
   }
   TRACE(broker, "Copied " << exports_.size() << " exports");
+
+  DCHECK_NULL(import_meta_);
+  import_meta_ = broker->GetOrCreateData(module->import_meta());
+  TRACE(broker, "Copied import_meta");
 }
 
 class CellData : public HeapObjectData {
@@ -2040,7 +2020,7 @@ class CodeData : public HeapObjectData {
   unsigned const inlined_bytecode_size_;
 };
 
-#define DEFINE_IS_AND_AS(Name)                                          \
+#define DEFINE_IS(Name)                                                 \
   bool ObjectData::Is##Name() const {                                   \
     if (should_access_heap()) {                                         \
       AllowHandleDereferenceIf allow_handle_dereference(kind());        \
@@ -2050,13 +2030,30 @@ class CodeData : public HeapObjectData {
     InstanceType instance_type =                                        \
         static_cast<const HeapObjectData*>(this)->GetMapInstanceType(); \
     return InstanceTypeChecker::Is##Name(instance_type);                \
-  }                                                                     \
-  Name##Data* ObjectData::As##Name() {                                  \
-    CHECK(Is##Name());                                                  \
-    return static_cast<Name##Data*>(this);                              \
   }
-HEAP_BROKER_OBJECT_LIST(DEFINE_IS_AND_AS)
-#undef DEFINE_IS_AND_AS
+HEAP_BROKER_SERIALIZED_OBJECT_LIST(DEFINE_IS)
+HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DEFINE_IS)
+#undef DEFINE_IS
+
+#define DEFINE_AS(Name)                    \
+  Name##Data* ObjectData::As##Name() {     \
+    CHECK(Is##Name());                     \
+    return static_cast<Name##Data*>(this); \
+  }
+HEAP_BROKER_SERIALIZED_OBJECT_LIST(DEFINE_AS)
+#undef DEFINE_AS
+
+// TODO(solanes, v8:10866): Remove once FLAG_turbo_direct_heap_access is
+// removed.
+// This macro defines the Asxxx methods for NeverSerialized objects, which
+// should only be used with direct heap access off.
+#define DEFINE_AS_DIRECT_ACCESS(Name)                    \
+  Name##Data* ObjectData::As##Name() {                   \
+    CHECK(Is##Name() && !FLAG_turbo_direct_heap_access); \
+    return static_cast<Name##Data*>(this);               \
+  }
+HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DEFINE_AS_DIRECT_ACCESS)
+#undef DEFINE_AS_DIRECT_ACCESS
 
 const JSObjectField& JSObjectData::GetInobjectField(int property_index) const {
   CHECK_LT(static_cast<size_t>(property_index), inobject_fields_.size());
@@ -2210,7 +2207,7 @@ void JSObjectData::SerializeRecursiveAsBoilerplate(JSHeapBroker* broker,
   Handle<JSObject> boilerplate = Handle<JSObject>::cast(object());
 
   // We only serialize boilerplates that pass the IsInlinableFastLiteral
-  // check, so we only do a sanity check on the depth here.
+  // check, so we only do a check on the depth here.
   CHECK_GT(depth, 0);
   CHECK(!boilerplate->map().is_deprecated());
 
@@ -2384,19 +2381,35 @@ base::Optional<ObjectRef> ContextRef::get(int index,
   return base::nullopt;
 }
 
+SourceTextModuleRef ContextRef::GetModule(SerializationPolicy policy) const {
+  ContextRef current = *this;
+  while (current.map().instance_type() != MODULE_CONTEXT_TYPE) {
+    size_t depth = 1;
+    current = current.previous(&depth, policy);
+    CHECK_EQ(depth, 0);
+  }
+  return current.get(Context::EXTENSION_INDEX, policy)
+      .value()
+      .AsSourceTextModule();
+}
+
 JSHeapBroker::JSHeapBroker(Isolate* isolate, Zone* broker_zone,
-                           bool tracing_enabled, bool is_concurrent_inlining)
+                           bool tracing_enabled, bool is_concurrent_inlining,
+                           bool is_native_context_independent)
     : isolate_(isolate),
       zone_(broker_zone),
-      refs_(new (zone())
-                RefsMap(kMinimalRefsBucketCount, AddressMatcher(), zone())),
+      refs_(zone()->New<RefsMap>(kMinimalRefsBucketCount, AddressMatcher(),
+                                 zone())),
       root_index_map_(isolate),
       array_and_object_prototypes_(zone()),
       tracing_enabled_(tracing_enabled),
       is_concurrent_inlining_(is_concurrent_inlining),
+      is_native_context_independent_(is_native_context_independent),
+      local_heap_(base::nullopt),
       feedback_(zone()),
       bytecode_analyses_(zone()),
       property_access_infos_(zone()),
+      minimorphic_property_access_infos_(zone()),
       typed_array_string_tags_(zone()),
       serialized_functions_(zone()) {
   // Note that this initialization of {refs_} with the minimal initial capacity
@@ -2407,9 +2420,50 @@ JSHeapBroker::JSHeapBroker(Isolate* isolate, Zone* broker_zone,
   TRACE(this, "Constructing heap broker");
 }
 
-std::ostream& JSHeapBroker::Trace() const {
-  return trace_out_ << "[" << this << "] "
-                    << std::string(trace_indentation_ * 2, ' ');
+JSHeapBroker::~JSHeapBroker() { DCHECK(!local_heap_); }
+
+void JSHeapBroker::SetPersistentAndCopyCanonicalHandlesForTesting(
+    std::unique_ptr<PersistentHandles> persistent_handles,
+    std::unique_ptr<CanonicalHandlesMap> canonical_handles) {
+  set_persistent_handles(std::move(persistent_handles));
+  CopyCanonicalHandlesForTesting(std::move(canonical_handles));
+}
+
+void JSHeapBroker::CopyCanonicalHandlesForTesting(
+    std::unique_ptr<CanonicalHandlesMap> canonical_handles) {
+  DCHECK_NULL(canonical_handles_);
+  canonical_handles_ = std::make_unique<CanonicalHandlesMap>(
+      isolate_->heap(), ZoneAllocationPolicy(zone()));
+
+  CanonicalHandlesMap::IteratableScope it_scope(canonical_handles.get());
+  for (auto it = it_scope.begin(); it != it_scope.end(); ++it) {
+    Address* entry = *it.entry();
+    Object key = it.key();
+    canonical_handles_->Set(key, entry);
+  }
+}
+
+std::string JSHeapBroker::Trace() const {
+  std::ostringstream oss;
+  oss << "[" << this << "] ";
+  for (unsigned i = 0; i < trace_indentation_ * 2; ++i) oss.put(' ');
+  return oss.str();
+}
+
+void JSHeapBroker::InitializeLocalHeap(OptimizedCompilationInfo* info) {
+  set_persistent_handles(info->DetachPersistentHandles());
+  set_canonical_handles(info->DetachCanonicalHandles());
+  DCHECK(!local_heap_);
+  local_heap_.emplace(isolate_->heap(), std::move(ph_));
+}
+
+void JSHeapBroker::TearDownLocalHeap(OptimizedCompilationInfo* info) {
+  DCHECK_NULL(ph_);
+  DCHECK(local_heap_);
+  ph_ = local_heap_->DetachPersistentHandles();
+  local_heap_.reset();
+  info->set_canonical_handles(DetachCanonicalHandles());
+  info->set_persistent_handles(DetachPersistentHandles());
 }
 
 void JSHeapBroker::StopSerializing() {
@@ -2615,7 +2669,7 @@ void JSHeapBroker::InitializeAndStartSerializing(
   refs_ = nullptr;
 
   refs_ =
-      new (zone()) RefsMap(kInitialRefsBucketCount, AddressMatcher(), zone());
+      zone()->New<RefsMap>(kInitialRefsBucketCount, AddressMatcher(), zone());
 
   SetTargetNativeContextRef(native_context);
   target_native_context().Serialize();
@@ -2661,34 +2715,54 @@ void JSHeapBroker::InitializeAndStartSerializing(
 
 // clang-format off
 ObjectData* JSHeapBroker::GetOrCreateData(Handle<Object> object) {
-  RefsMap::Entry* entry = refs_->LookupOrInsert(object.address(), zone());
-  ObjectData** data_storage = &(entry->value);
-  if (*data_storage == nullptr) {
+  RefsMap::Entry* entry = refs_->LookupOrInsert(object.address());
+  ObjectData* object_data = entry->value;
+
+  if (object_data == nullptr) {
+    ObjectData** data_storage = &(entry->value);
     // TODO(neis): Remove these Allow* once we serialize everything upfront.
     AllowHandleDereference handle_dereference;
     if (object->IsSmi()) {
-      new (zone()) ObjectData(this, data_storage, object, kSmi);
+      object_data = zone()->New<ObjectData>(this, data_storage, object, kSmi);
     } else if (IsReadOnlyHeapObject(*object)) {
-      new (zone()) ObjectData(this, data_storage, object,
-                              kUnserializedReadOnlyHeapObject);
-#define CREATE_DATA_IF_MATCH(name)                                             \
-    } else if (object->Is##name()) {                                           \
-      CHECK(SerializingAllowed());                                             \
-      AllowHandleAllocation handle_allocation;                                 \
-      new (zone()) name##Data(this, data_storage, Handle<name>::cast(object));
-    HEAP_BROKER_OBJECT_LIST(CREATE_DATA_IF_MATCH)
-#undef CREATE_DATA_IF_MATCH
+      object_data = zone()->New<ObjectData>(this, data_storage, object,
+                                            kUnserializedReadOnlyHeapObject);
+// TODO(solanes, v8:10866): Remove the if/else in this macro once we remove the
+// FLAG_turbo_direct_heap_access.
+#define CREATE_DATA_FOR_DIRECT_READ(name)                                  \
+    } else if (object->Is##name()) {                                       \
+      if (FLAG_turbo_direct_heap_access) {                                 \
+        object_data = zone()->New<ObjectData>(                             \
+          this, data_storage, object, kNeverSerializedHeapObject);         \
+      } else {                                                             \
+        CHECK(SerializingAllowed());                                       \
+        AllowHandleAllocation handle_allocation;                           \
+        object_data = zone()->New<name##Data>(this, data_storage,          \
+                                              Handle<name>::cast(object)); \
+      }
+    HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(CREATE_DATA_FOR_DIRECT_READ)
+#undef CREATE_DATA_FOR_DIRECT_READ
+#define CREATE_DATA_FOR_SERIALIZATION(name)                     \
+    } else if (object->Is##name()) {                            \
+      CHECK(SerializingAllowed());                              \
+      AllowHandleAllocation handle_allocation;                  \
+      object_data = zone()->New<name##Data>(this, data_storage, \
+                                            Handle<name>::cast(object));
+    HEAP_BROKER_SERIALIZED_OBJECT_LIST(CREATE_DATA_FOR_SERIALIZATION)
+#undef CREATE_DATA_FOR_SERIALIZATION
     } else {
       UNREACHABLE();
     }
+    // At this point the entry pointer is not guaranteed to be valid as
+    // the refs_ hash hable could be resized by one of the constructors above.
+    DCHECK_EQ(object_data, refs_->Lookup(object.address())->value);
   }
-  CHECK_NOT_NULL(*data_storage);
-  return (*data_storage);
+  return object_data;
 }
 // clang-format on
 
 ObjectData* JSHeapBroker::GetOrCreateData(Object object) {
-  return GetOrCreateData(handle(object, isolate()));
+  return GetOrCreateData(CanonicalPersistentHandle(object));
 }
 
 #define DEFINE_IS_AND_AS(Name)                                    \
@@ -2697,7 +2771,8 @@ ObjectData* JSHeapBroker::GetOrCreateData(Object object) {
     DCHECK(Is##Name());                                           \
     return Name##Ref(broker(), data());                           \
   }
-HEAP_BROKER_OBJECT_LIST(DEFINE_IS_AND_AS)
+HEAP_BROKER_SERIALIZED_OBJECT_LIST(DEFINE_IS_AND_AS)
+HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DEFINE_IS_AND_AS)
 #undef DEFINE_IS_AND_AS
 
 bool ObjectRef::IsSmi() const { return data()->is_smi(); }
@@ -3166,28 +3241,10 @@ double FixedDoubleArrayRef::get_scalar(int i) const {
   return data()->AsFixedDoubleArray()->Get(i).get_scalar();
 }
 
-uint8_t BytecodeArrayRef::get(int index) const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleAllocationIf allow_handle_allocation(data()->kind(),
-                                                    broker()->mode());
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return object()->get(index);
-  }
-  return data()->AsBytecodeArray()->get(index);
-}
+uint8_t BytecodeArrayRef::get(int index) const { return object()->get(index); }
 
 Address BytecodeArrayRef::GetFirstBytecodeAddress() const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleAllocationIf allow_handle_allocation(data()->kind(),
-                                                    broker()->mode());
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return object()->GetFirstBytecodeAddress();
-  }
-  return data()->AsBytecodeArray()->GetFirstBytecodeAddress();
+  return object()->GetFirstBytecodeAddress();
 }
 
 Handle<Object> BytecodeArrayRef::GetConstantAtIndex(int index) const {
@@ -3233,45 +3290,18 @@ void BytecodeArrayRef::SerializeForCompilation() {
   data()->AsBytecodeArray()->SerializeForCompilation(broker());
 }
 
-const byte* BytecodeArrayRef::source_positions_address() const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return object()->SourcePositionTableIfCollected().GetDataStartAddress();
-  }
-  return data()->AsBytecodeArray()->source_positions_address();
-}
-
-int BytecodeArrayRef::source_positions_size() const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return object()->SourcePositionTableIfCollected().length();
-  }
-  return static_cast<int>(data()->AsBytecodeArray()->source_positions_size());
+Handle<ByteArray> BytecodeArrayRef::source_positions() const {
+  return broker()->CanonicalPersistentHandle(
+      object()->SourcePositionTableIfCollected());
 }
 
 Address BytecodeArrayRef::handler_table_address() const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return reinterpret_cast<Address>(
-        object()->handler_table().GetDataStartAddress());
-  }
-  return data()->AsBytecodeArray()->handler_table_address();
+  return reinterpret_cast<Address>(
+      object()->handler_table().GetDataStartAddress());
 }
 
 int BytecodeArrayRef::handler_table_size() const {
-  if (data_->should_access_heap()) {
-    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
-    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
-                                                      broker()->mode());
-    return object()->handler_table().length();
-  }
-  return data()->AsBytecodeArray()->handler_table_size();
+  return object()->handler_table().length();
 }
 
 Handle<Object> JSHeapBroker::GetRootHandle(Object object) {
@@ -3280,10 +3310,8 @@ Handle<Object> JSHeapBroker::GetRootHandle(Object object) {
   return Handle<Object>(isolate()->root_handle(root_index).location());
 }
 
-#define IF_ACCESS_FROM_HEAP_C(holder, name)                              \
+#define IF_ACCESS_FROM_HEAP_C(name)                                      \
   if (data_->should_access_heap()) {                                     \
-    CHECK(broker()->mode() == JSHeapBroker::kDisabled ||                 \
-          ReadOnlyHeap::Contains(HeapObject::cast(*object())));          \
     AllowHandleAllocationIf handle_allocation(data_->kind(),             \
                                               broker()->mode());         \
     AllowHandleDereferenceIf allow_handle_dereference(data_->kind(),     \
@@ -3291,26 +3319,29 @@ Handle<Object> JSHeapBroker::GetRootHandle(Object object) {
     return object()->name();                                             \
   }
 
-#define IF_ACCESS_FROM_HEAP(holder, result, name)                            \
-  if (data_->kind() == ObjectDataKind::kUnserializedHeapObject) {            \
-    AllowHandleAllocationIf handle_allocation(data_->kind(),                 \
-                                              broker()->mode());             \
-    AllowHandleDereferenceIf handle_dereference(data_->kind(),               \
-                                                broker()->mode());           \
-    return result##Ref(broker(),                                             \
-                       handle(object()->name(), broker()->isolate()));       \
-  } else if (data_->kind() ==                                                \
-             ObjectDataKind::kUnserializedReadOnlyHeapObject) {              \
-    AllowHandleDereferenceIf handle_dereference(data_->kind(),               \
-                                                broker()->mode());           \
-    return result##Ref(broker(), broker()->GetRootHandle(object()->name())); \
+#define IF_ACCESS_FROM_HEAP(result, name)                                      \
+  if (data_->kind() == ObjectDataKind::kUnserializedHeapObject) {              \
+    AllowHandleAllocationIf handle_allocation(data_->kind(),                   \
+                                              broker()->mode());               \
+    AllowHandleDereferenceIf handle_dereference(data_->kind(),                 \
+                                                broker()->mode());             \
+    return result##Ref(broker(),                                               \
+                       handle(object()->name(), broker()->isolate()));         \
+  } else if (data_->kind() ==                                                  \
+             ObjectDataKind::kUnserializedReadOnlyHeapObject) {                \
+    AllowHandleDereferenceIf handle_dereference(data_->kind(),                 \
+                                                broker()->mode());             \
+    return result##Ref(broker(), broker()->GetRootHandle(object()->name()));   \
+  } else if (data_->kind() == ObjectDataKind::kNeverSerializedHeapObject) {    \
+    return result##Ref(broker(),                                               \
+                       broker()->CanonicalPersistentHandle(object()->name())); \
   }
 
 // Macros for definining a const getter that, depending on the broker mode,
 // either looks into the handle or into the serialized data.
 #define BIMODAL_ACCESSOR(holder, result, name)                               \
   result##Ref holder##Ref::name() const {                                    \
-    IF_ACCESS_FROM_HEAP(holder, result, name);                               \
+    IF_ACCESS_FROM_HEAP(result, name);                                       \
     ObjectData* data = ObjectRef::data()->As##holder()->name();              \
     if (data->kind() == ObjectDataKind::kUnserializedHeapObject) {           \
       return result##Ref(broker(), data->object());                          \
@@ -3322,14 +3353,14 @@ Handle<Object> JSHeapBroker::GetRootHandle(Object object) {
 // Like above except that the result type is not an XYZRef.
 #define BIMODAL_ACCESSOR_C(holder, result, name)    \
   result holder##Ref::name() const {                \
-    IF_ACCESS_FROM_HEAP_C(holder, name);            \
+    IF_ACCESS_FROM_HEAP_C(name);                    \
     return ObjectRef::data()->As##holder()->name(); \
   }
 
 // Like above but for BitFields.
 #define BIMODAL_ACCESSOR_B(holder, field, name, BitField)              \
   typename BitField::FieldType holder##Ref::name() const {             \
-    IF_ACCESS_FROM_HEAP_C(holder, name);                               \
+    IF_ACCESS_FROM_HEAP_C(name);                                       \
     return BitField::decode(ObjectRef::data()->As##holder()->field()); \
   }
 
@@ -3362,7 +3393,7 @@ BIMODAL_ACCESSOR_C(JSDataView, size_t, byte_offset)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_feedback_vector)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_initial_map)
 BIMODAL_ACCESSOR_C(JSFunction, bool, has_prototype)
-BIMODAL_ACCESSOR_C(JSFunction, bool, IsOptimized)
+BIMODAL_ACCESSOR_C(JSFunction, bool, HasAttachedOptimizedCode)
 BIMODAL_ACCESSOR_C(JSFunction, bool, PrototypeRequiresRuntimeLookup)
 BIMODAL_ACCESSOR(JSFunction, Context, context)
 BIMODAL_ACCESSOR(JSFunction, NativeContext, native_context)
@@ -3599,50 +3630,50 @@ void* JSTypedArrayRef::data_ptr() const {
 }
 
 bool MapRef::IsInobjectSlackTrackingInProgress() const {
-  IF_ACCESS_FROM_HEAP_C(Map, IsInobjectSlackTrackingInProgress);
+  IF_ACCESS_FROM_HEAP_C(IsInobjectSlackTrackingInProgress);
   return Map::Bits3::ConstructionCounterBits::decode(
              data()->AsMap()->bit_field3()) != Map::kNoSlackTracking;
 }
 
 int MapRef::constructor_function_index() const {
-  IF_ACCESS_FROM_HEAP_C(Map, GetConstructorFunctionIndex);
+  IF_ACCESS_FROM_HEAP_C(GetConstructorFunctionIndex);
   CHECK(IsPrimitiveMap());
   return data()->AsMap()->constructor_function_index();
 }
 
 bool MapRef::is_stable() const {
-  IF_ACCESS_FROM_HEAP_C(Map, is_stable);
+  IF_ACCESS_FROM_HEAP_C(is_stable);
   return !Map::Bits3::IsUnstableBit::decode(data()->AsMap()->bit_field3());
 }
 
 bool MapRef::CanBeDeprecated() const {
-  IF_ACCESS_FROM_HEAP_C(Map, CanBeDeprecated);
+  IF_ACCESS_FROM_HEAP_C(CanBeDeprecated);
   CHECK_GT(NumberOfOwnDescriptors(), 0);
   return data()->AsMap()->can_be_deprecated();
 }
 
 bool MapRef::CanTransition() const {
-  IF_ACCESS_FROM_HEAP_C(Map, CanTransition);
+  IF_ACCESS_FROM_HEAP_C(CanTransition);
   return data()->AsMap()->can_transition();
 }
 
 int MapRef::GetInObjectPropertiesStartInWords() const {
-  IF_ACCESS_FROM_HEAP_C(Map, GetInObjectPropertiesStartInWords);
+  IF_ACCESS_FROM_HEAP_C(GetInObjectPropertiesStartInWords);
   return data()->AsMap()->in_object_properties_start_in_words();
 }
 
 int MapRef::GetInObjectProperties() const {
-  IF_ACCESS_FROM_HEAP_C(Map, GetInObjectProperties);
+  IF_ACCESS_FROM_HEAP_C(GetInObjectProperties);
   return data()->AsMap()->in_object_properties();
 }
 
 int ScopeInfoRef::ContextLength() const {
-  IF_ACCESS_FROM_HEAP_C(ScopeInfo, ContextLength);
+  IF_ACCESS_FROM_HEAP_C(ContextLength);
   return data()->AsScopeInfo()->context_length();
 }
 
 int ScopeInfoRef::Flags() const {
-  IF_ACCESS_FROM_HEAP_C(ScopeInfo, Flags);
+  IF_ACCESS_FROM_HEAP_C(Flags);
   return data()->AsScopeInfo()->flags();
 }
 
@@ -3651,7 +3682,7 @@ bool ScopeInfoRef::HasContextExtension() const {
 }
 
 bool ScopeInfoRef::HasOuterScopeInfo() const {
-  IF_ACCESS_FROM_HEAP_C(ScopeInfo, HasOuterScopeInfo);
+  IF_ACCESS_FROM_HEAP_C(HasOuterScopeInfo);
   return data()->AsScopeInfo()->has_outer_scope_info();
 }
 
@@ -3674,7 +3705,7 @@ void ScopeInfoRef::SerializeScopeInfoChain() {
 }
 
 bool StringRef::IsExternalString() const {
-  IF_ACCESS_FROM_HEAP_C(String, IsExternalString);
+  IF_ACCESS_FROM_HEAP_C(IsExternalString);
   return data()->AsString()->is_external_string();
 }
 
@@ -3700,7 +3731,7 @@ const CFunctionInfo* FunctionTemplateInfoRef::c_signature() const {
 }
 
 bool StringRef::IsSeqString() const {
-  IF_ACCESS_FROM_HEAP_C(String, IsSeqString);
+  IF_ACCESS_FROM_HEAP_C(IsSeqString);
   return data()->AsString()->is_seq_string();
 }
 
@@ -3711,8 +3742,8 @@ ScopeInfoRef NativeContextRef::scope_info() const {
                                                     broker()->mode());
     AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
                                                       broker()->mode());
-    return ScopeInfoRef(broker(),
-                        handle(object()->scope_info(), broker()->isolate()));
+    return ScopeInfoRef(
+        broker(), broker()->CanonicalPersistentHandle(object()->scope_info()));
   }
   return ScopeInfoRef(broker(), data()->AsNativeContext()->scope_info());
 }
@@ -3787,6 +3818,11 @@ bool ObjectRef::IsNullOrUndefined() const {
   if (IsSmi()) return false;
   OddballType type = AsHeapObject().map().oddball_type();
   return type == OddballType::kNull || type == OddballType::kUndefined;
+}
+
+bool ObjectRef::IsTheHole() const {
+  return IsHeapObject() &&
+         AsHeapObject().map().oddball_type() == OddballType::kHole;
 }
 
 bool ObjectRef::BooleanValue() const {
@@ -3886,12 +3922,12 @@ base::Optional<ObjectRef> JSArrayRef::GetOwnCowElement(
 }
 
 double HeapNumberRef::value() const {
-  IF_ACCESS_FROM_HEAP_C(HeapNumber, value);
+  IF_ACCESS_FROM_HEAP_C(value);
   return data()->AsHeapNumber()->value();
 }
 
 uint64_t BigIntRef::AsUint64() const {
-  IF_ACCESS_FROM_HEAP_C(BigInt, AsUint64);
+  IF_ACCESS_FROM_HEAP_C(AsUint64);
   return data()->AsBigInt()->AsUint64();
 }
 
@@ -3910,6 +3946,20 @@ base::Optional<CellRef> SourceTextModuleRef::GetCell(int cell_index) const {
   return CellRef(broker(), cell);
 }
 
+ObjectRef SourceTextModuleRef::import_meta() const {
+  if (data_->should_access_heap()) {
+    DCHECK(data_->kind() != ObjectDataKind::kUnserializedReadOnlyHeapObject);
+    AllowHandleAllocationIf allow_handle_allocation(data()->kind(),
+                                                    broker()->mode());
+    AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
+                                                      broker()->mode());
+    return ObjectRef(broker(),
+                     handle(object()->import_meta(), broker()->isolate()));
+  }
+  return ObjectRef(broker(),
+                   data()->AsSourceTextModule()->GetImportMeta(broker()));
+}
+
 ObjectRef::ObjectRef(JSHeapBroker* broker, Handle<Object> object,
                      bool check_type)
     : broker_(broker) {
@@ -3922,15 +3972,14 @@ ObjectRef::ObjectRef(JSHeapBroker* broker, Handle<Object> object,
       data_ = broker->GetOrCreateData(object);
       break;
     case JSHeapBroker::kDisabled: {
-      RefsMap::Entry* entry =
-          broker->refs_->LookupOrInsert(object.address(), broker->zone());
+      RefsMap::Entry* entry = broker->refs_->LookupOrInsert(object.address());
       ObjectData** storage = &(entry->value);
       if (*storage == nullptr) {
         AllowHandleDereferenceIf allow_handle_dereference(
             kUnserializedHeapObject, broker->mode());
-        entry->value = new (broker->zone())
-            ObjectData(broker, storage, object,
-                       object->IsSmi() ? kSmi : kUnserializedHeapObject);
+        entry->value = broker->zone()->New<ObjectData>(
+            broker, storage, object,
+            object->IsSmi() ? kSmi : kUnserializedHeapObject);
       }
       data_ = *storage;
       break;
@@ -4031,7 +4080,7 @@ FixedArrayBaseRef JSObjectRef::elements() const {
 }
 
 int FixedArrayBaseRef::length() const {
-  IF_ACCESS_FROM_HEAP_C(FixedArrayBase, length);
+  IF_ACCESS_FROM_HEAP_C(length);
   return data()->AsFixedArrayBase()->length();
 }
 
@@ -4073,28 +4122,28 @@ bool NameRef::IsUniqueName() const {
 }
 
 ObjectRef JSRegExpRef::data() const {
-  IF_ACCESS_FROM_HEAP(JSRegExp, Object, data);
+  IF_ACCESS_FROM_HEAP(Object, data);
   return ObjectRef(broker(), ObjectRef::data()->AsJSRegExp()->data());
 }
 
 ObjectRef JSRegExpRef::flags() const {
-  IF_ACCESS_FROM_HEAP(JSRegExp, Object, flags);
+  IF_ACCESS_FROM_HEAP(Object, flags);
   return ObjectRef(broker(), ObjectRef::data()->AsJSRegExp()->flags());
 }
 
 ObjectRef JSRegExpRef::last_index() const {
-  IF_ACCESS_FROM_HEAP(JSRegExp, Object, last_index);
+  IF_ACCESS_FROM_HEAP(Object, last_index);
   return ObjectRef(broker(), ObjectRef::data()->AsJSRegExp()->last_index());
 }
 
 ObjectRef JSRegExpRef::raw_properties_or_hash() const {
-  IF_ACCESS_FROM_HEAP(JSRegExp, Object, raw_properties_or_hash);
+  IF_ACCESS_FROM_HEAP(Object, raw_properties_or_hash);
   return ObjectRef(broker(),
                    ObjectRef::data()->AsJSRegExp()->raw_properties_or_hash());
 }
 
 ObjectRef JSRegExpRef::source() const {
-  IF_ACCESS_FROM_HEAP(JSRegExp, Object, source);
+  IF_ACCESS_FROM_HEAP(Object, source);
   return ObjectRef(broker(), ObjectRef::data()->AsJSRegExp()->source());
 }
 
@@ -4129,7 +4178,8 @@ Handle<Object> ObjectRef::object() const {
   }
 #endif  // DEBUG
 
-HEAP_BROKER_OBJECT_LIST(DEF_OBJECT_GETTER)
+HEAP_BROKER_SERIALIZED_OBJECT_LIST(DEF_OBJECT_GETTER)
+HEAP_BROKER_NEVER_SERIALIZED_OBJECT_LIST(DEF_OBJECT_GETTER)
 #undef DEF_OBJECT_GETTER
 
 JSHeapBroker* ObjectRef::broker() const { return broker_; }
@@ -4287,7 +4337,7 @@ SharedFunctionInfoRef::function_template_info() const {
 }
 
 int SharedFunctionInfoRef::context_header_size() const {
-  IF_ACCESS_FROM_HEAP_C(SharedFunctionInfo, scope_info().ContextHeaderLength);
+  IF_ACCESS_FROM_HEAP_C(scope_info().ContextHeaderLength);
   return data()->AsSharedFunctionInfo()->context_header_size();
 }
 
@@ -4298,8 +4348,8 @@ ScopeInfoRef SharedFunctionInfoRef::scope_info() const {
                                                     broker()->mode());
     AllowHandleDereferenceIf allow_handle_dereference(data()->kind(),
                                                       broker()->mode());
-    return ScopeInfoRef(broker(),
-                        handle(object()->scope_info(), broker()->isolate()));
+    return ScopeInfoRef(
+        broker(), broker()->CanonicalPersistentHandle(object()->scope_info()));
   }
   return ScopeInfoRef(broker(), data()->AsSharedFunctionInfo()->scope_info());
 }
@@ -4439,7 +4489,7 @@ ElementAccessFeedback::transition_groups() const {
 ElementAccessFeedback const& ElementAccessFeedback::Refine(
     ZoneVector<Handle<Map>> const& inferred_maps, Zone* zone) const {
   ElementAccessFeedback& refined_feedback =
-      *new (zone) ElementAccessFeedback(zone, keyed_mode(), slot_kind());
+      *zone->New<ElementAccessFeedback>(zone, keyed_mode(), slot_kind());
   if (inferred_maps.empty()) return refined_feedback;
 
   ZoneUnorderedSet<Handle<Map>, Handle<Map>::hash, Handle<Map>::equal_to>
@@ -4486,7 +4536,6 @@ GlobalAccessFeedback::GlobalAccessFeedback(PropertyCellRef cell,
 
 GlobalAccessFeedback::GlobalAccessFeedback(FeedbackSlotKind slot_kind)
     : ProcessedFeedback(kGlobalAccess, slot_kind),
-      cell_or_context_(base::nullopt),
       index_and_immutable_(0 /* doesn't matter */) {
   DCHECK(IsGlobalICKind(slot_kind));
 }
@@ -4617,6 +4666,17 @@ bool ElementAccessFeedback::HasOnlyStringMaps(JSHeapBroker* broker) const {
   return true;
 }
 
+MinimorphicLoadPropertyAccessFeedback::MinimorphicLoadPropertyAccessFeedback(
+    NameRef const& name, FeedbackSlotKind slot_kind, bool is_monomorphic,
+    Handle<Object> handler, bool has_migration_target_maps)
+    : ProcessedFeedback(kMinimorphicPropertyAccess, slot_kind),
+      name_(name),
+      is_monomorphic_(is_monomorphic),
+      handler_(handler),
+      has_migration_target_maps_(has_migration_target_maps) {
+  DCHECK(IsLoadICKind(slot_kind));
+}
+
 NamedAccessFeedback::NamedAccessFeedback(NameRef const& name,
                                          ZoneVector<Handle<Map>> const& maps,
                                          FeedbackSlotKind slot_kind)
@@ -4684,31 +4744,89 @@ void FilterRelevantReceiverMaps(Isolate* isolate, MapHandles* maps) {
   // Remove everything between the last valid map and the end of the vector.
   maps->erase(out, end);
 }
+
+MaybeObjectHandle TryGetMinimorphicHandler(
+    std::vector<MapAndHandler> const& maps_and_handlers,
+    FeedbackSlotKind kind) {
+  if (!FLAG_dynamic_map_checks || !IsLoadICKind(kind))
+    return MaybeObjectHandle();
+
+  MaybeObjectHandle initial_handler;
+  for (MapAndHandler map_and_handler : maps_and_handlers) {
+    auto map = map_and_handler.first;
+    MaybeObjectHandle handler = map_and_handler.second;
+    if (handler.is_null()) return MaybeObjectHandle();
+    DCHECK(!handler->IsCleared());
+    // TODO(mythria): extend this to DataHandlers too
+    if (!handler.object()->IsSmi()) return MaybeObjectHandle();
+    if (LoadHandler::GetHandlerKind(handler.object()->ToSmi()) !=
+        LoadHandler::Kind::kField) {
+      return MaybeObjectHandle();
+    }
+    CHECK(!map->IsJSGlobalProxyMap());
+    if (initial_handler.is_null()) {
+      initial_handler = handler;
+    } else if (!handler.is_identical_to(initial_handler)) {
+      return MaybeObjectHandle();
+    }
+  }
+  return initial_handler;
+}
+
+bool HasMigrationTargets(const MapHandles& maps) {
+  for (Handle<Map> map : maps) {
+    if (map->is_migration_target()) return true;
+  }
+  return false;
+}
 }  // namespace
+
+bool JSHeapBroker::CanUseFeedback(const FeedbackNexus& nexus) const {
+  // TODO(jgruber,v8:8888): Currently, nci code does not use any
+  // feedback. This restriction will be relaxed in the future.
+  return !is_native_context_independent() && !nexus.IsUninitialized();
+}
+
+const ProcessedFeedback& JSHeapBroker::NewInsufficientFeedback(
+    FeedbackSlotKind kind) const {
+  return *zone()->New<InsufficientFeedback>(kind);
+}
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
     FeedbackSource const& source, AccessMode mode,
     base::Optional<NameRef> static_name) {
   FeedbackNexus nexus(source.vector, source.slot);
   FeedbackSlotKind kind = nexus.kind();
-  if (nexus.IsUninitialized()) return *new (zone()) InsufficientFeedback(kind);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(kind);
 
+  std::vector<MapAndHandler> maps_and_handlers;
+  nexus.ExtractMapsAndFeedback(&maps_and_handlers);
   MapHandles maps;
-  nexus.ExtractMaps(&maps);
-  FilterRelevantReceiverMaps(isolate(), &maps);
-
-  // If no maps were found for a non-megamorphic access, then our maps died and
-  // we should soft-deopt.
-  if (maps.empty() && nexus.ic_state() != MEGAMORPHIC) {
-    return *new (zone()) InsufficientFeedback(kind);
+  for (auto const& entry : maps_and_handlers) {
+    maps.push_back(entry.first);
   }
 
   base::Optional<NameRef> name =
       static_name.has_value() ? static_name : GetNameFeedback(nexus);
+  MaybeObjectHandle handler = TryGetMinimorphicHandler(maps_and_handlers, kind);
+  if (!handler.is_null()) {
+    return *zone()->New<MinimorphicLoadPropertyAccessFeedback>(
+        *name, kind, nexus.ic_state() == MONOMORPHIC, handler.object(),
+        HasMigrationTargets(maps));
+  }
+
+  FilterRelevantReceiverMaps(isolate(), &maps);
+
+  // If no maps were found for a non-megamorphic access, then our maps died
+  // and we should soft-deopt.
+  if (maps.empty() && nexus.ic_state() != MEGAMORPHIC) {
+    return NewInsufficientFeedback(kind);
+  }
+
   if (name.has_value()) {
     // We rely on this invariant in JSGenericLowering.
     DCHECK_IMPLIES(maps.empty(), nexus.ic_state() == MEGAMORPHIC);
-    return *new (zone()) NamedAccessFeedback(
+    return *zone()->New<NamedAccessFeedback>(
         *name, ZoneVector<Handle<Map>>(maps.begin(), maps.end(), zone()), kind);
   } else if (nexus.GetKeyType() == ELEMENT && !maps.empty()) {
     return ProcessFeedbackMapsForElementAccess(
@@ -4718,8 +4836,8 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForPropertyAccess(
     DCHECK(maps.empty());
     DCHECK_EQ(nexus.ic_state(), MEGAMORPHIC);
     // TODO(neis): Using ElementAccessFeedback here is kind of an abuse.
-    return *new (zone())
-        ElementAccessFeedback(zone(), KeyedAccessMode::FromNexus(nexus), kind);
+    return *zone()->New<ElementAccessFeedback>(
+        zone(), KeyedAccessMode::FromNexus(nexus), kind);
   }
 }
 
@@ -4730,19 +4848,17 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
          nexus.kind() == FeedbackSlotKind::kLoadGlobalNotInsideTypeof ||
          nexus.kind() == FeedbackSlotKind::kStoreGlobalSloppy ||
          nexus.kind() == FeedbackSlotKind::kStoreGlobalStrict);
-  if (nexus.IsUninitialized()) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
-  }
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
   if (nexus.ic_state() != MONOMORPHIC || nexus.GetFeedback()->IsCleared()) {
-    return *new (zone()) GlobalAccessFeedback(nexus.kind());
+    return *zone()->New<GlobalAccessFeedback>(nexus.kind());
   }
 
   Handle<Object> feedback_value(nexus.GetFeedback()->GetHeapObjectOrSmi(),
                                 isolate());
 
   if (feedback_value->IsSmi()) {
-    // The wanted name belongs to a script-scope variable and the feedback tells
-    // us where to find its value.
+    // The wanted name belongs to a script-scope variable and the feedback
+    // tells us where to find its value.
     int number = feedback_value->Number();
     int const script_context_index =
         FeedbackNexus::ContextIndexBits::decode(number);
@@ -4762,7 +4878,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
       context_ref.get(context_slot_index,
                       SerializationPolicy::kSerializeIfNeeded);
     }
-    return *new (zone()) GlobalAccessFeedback(context_ref, context_slot_index,
+    return *zone()->New<GlobalAccessFeedback>(context_ref, context_slot_index,
                                               immutable, nexus.kind());
   }
 
@@ -4771,30 +4887,40 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForGlobalAccess(
   // object and the feedback is the cell holding its value.
   PropertyCellRef cell(this, Handle<PropertyCell>::cast(feedback_value));
   cell.Serialize();
-  return *new (zone()) GlobalAccessFeedback(cell, nexus.kind());
+  return *zone()->New<GlobalAccessFeedback>(cell, nexus.kind());
 }
 
-BinaryOperationHint JSHeapBroker::ReadFeedbackForBinaryOperation(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForBinaryOperation(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot).GetBinaryOperationFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  BinaryOperationHint hint = nexus.GetBinaryOperationFeedback();
+  DCHECK_NE(hint, BinaryOperationHint::kNone);  // Not uninitialized.
+  return *zone()->New<BinaryOperationFeedback>(hint, nexus.kind());
 }
 
-CompareOperationHint JSHeapBroker::ReadFeedbackForCompareOperation(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCompareOperation(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot)
-      .GetCompareOperationFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  CompareOperationHint hint = nexus.GetCompareOperationFeedback();
+  DCHECK_NE(hint, CompareOperationHint::kNone);  // Not uninitialized.
+  return *zone()->New<CompareOperationFeedback>(hint, nexus.kind());
 }
 
-ForInHint JSHeapBroker::ReadFeedbackForForIn(
+ProcessedFeedback const& JSHeapBroker::ReadFeedbackForForIn(
     FeedbackSource const& source) const {
-  return FeedbackNexus(source.vector, source.slot).GetForInFeedback();
+  FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+  ForInHint hint = nexus.GetForInFeedback();
+  DCHECK_NE(hint, ForInHint::kNone);  // Not uninitialized.
+  return *zone()->New<ForInFeedback>(hint, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForInstanceOf(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
-  if (nexus.IsUninitialized())
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
 
   base::Optional<JSObjectRef> optional_constructor;
   {
@@ -4804,15 +4930,17 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForInstanceOf(
       optional_constructor = JSObjectRef(this, constructor);
     }
   }
-  return *new (zone()) InstanceOfFeedback(optional_constructor, nexus.kind());
+  return *zone()->New<InstanceOfFeedback>(optional_constructor, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForArrayOrObjectLiteral(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   AllocationSiteRef site(this, handle(object, isolate()));
@@ -4820,39 +4948,42 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForArrayOrObjectLiteral(
     site.SerializeBoilerplate();
   }
 
-  return *new (zone()) LiteralFeedback(site, nexus.kind());
+  return *zone()->New<LiteralFeedback>(site, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForRegExpLiteral(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   JSRegExpRef regexp(this, handle(object, isolate()));
   regexp.SerializeAsRegExpBoilerplate();
-  return *new (zone()) RegExpLiteralFeedback(regexp, nexus.kind());
+  return *zone()->New<RegExpLiteralFeedback>(regexp, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForTemplateObject(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
+
   HeapObject object;
-  if (nexus.IsUninitialized() || !nexus.GetFeedback()->GetHeapObject(&object)) {
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!nexus.GetFeedback()->GetHeapObject(&object)) {
+    return NewInsufficientFeedback(nexus.kind());
   }
 
   JSArrayRef array(this, handle(object, isolate()));
-  return *new (zone()) TemplateObjectFeedback(array, nexus.kind());
+  return *zone()->New<TemplateObjectFeedback>(array, nexus.kind());
 }
 
 ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCall(
     FeedbackSource const& source) {
   FeedbackNexus nexus(source.vector, source.slot);
-  if (nexus.IsUninitialized())
-    return *new (zone()) InsufficientFeedback(nexus.kind());
+  if (!CanUseFeedback(nexus)) return NewInsufficientFeedback(nexus.kind());
 
   base::Optional<HeapObjectRef> target_ref;
   {
@@ -4864,7 +4995,7 @@ ProcessedFeedback const& JSHeapBroker::ReadFeedbackForCall(
   }
   float frequency = nexus.ComputeCallFrequency();
   SpeculationMode mode = nexus.GetSpeculationMode();
-  return *new (zone()) CallFeedback(target_ref, frequency, mode, nexus.kind());
+  return *zone()->New<CallFeedback>(target_ref, frequency, mode, nexus.kind());
 }
 
 BinaryOperationHint JSHeapBroker::GetFeedbackForBinaryOperation(
@@ -4966,49 +5097,25 @@ ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForTemplateObject(
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForBinaryOperation(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  BinaryOperationHint hint = ReadFeedbackForBinaryOperation(source);
-  ProcessedFeedback const* feedback;
-  if (hint == BinaryOperationHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback = new (zone())
-        BinaryOperationFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForBinaryOperation(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForCompareOperation(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  CompareOperationHint hint = ReadFeedbackForCompareOperation(source);
-  ProcessedFeedback const* feedback;
-  if (hint == CompareOperationHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback = new (zone())
-        CompareOperationFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForCompareOperation(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForForIn(
     FeedbackSource const& source) {
   if (HasFeedback(source)) return GetFeedback(source);
-  ForInHint hint = ReadFeedbackForForIn(source);
-  ProcessedFeedback const* feedback;
-  if (hint == ForInHint::kNone) {
-    feedback =
-        new (zone()) InsufficientFeedback(source.vector->GetKind(source.slot));
-  } else {
-    feedback =
-        new (zone()) ForInFeedback(hint, source.vector->GetKind(source.slot));
-  }
-  SetFeedback(source, feedback);
-  return *feedback;
+  ProcessedFeedback const& feedback = ReadFeedbackForForIn(source);
+  SetFeedback(source, &feedback);
+  return feedback;
 }
 
 ProcessedFeedback const& JSHeapBroker::ProcessFeedbackForPropertyAccess(
@@ -5089,7 +5196,7 @@ ElementAccessFeedback const& JSHeapBroker::ProcessFeedbackMapsForElementAccess(
   }
 
   ElementAccessFeedback* result =
-      new (zone()) ElementAccessFeedback(zone(), keyed_mode, slot_kind);
+      zone()->New<ElementAccessFeedback>(zone(), keyed_mode, slot_kind);
   for (auto entry : transition_groups) {
     result->AddGroup(std::move(entry.second));
   }
@@ -5168,6 +5275,29 @@ PropertyAccessInfo JSHeapBroker::GetPropertyAccessInfo(
   return access_info;
 }
 
+MinimorphicLoadPropertyAccessInfo JSHeapBroker::GetPropertyAccessInfo(
+    MinimorphicLoadPropertyAccessFeedback const& feedback,
+    FeedbackSource const& source, SerializationPolicy policy) {
+  auto it = minimorphic_property_access_infos_.find(source.index());
+  if (it != minimorphic_property_access_infos_.end()) return it->second;
+
+  if (policy == SerializationPolicy::kAssumeSerialized) {
+    TRACE_BROKER_MISSING(
+        this, "MinimorphicLoadPropertyAccessInfo for slot " << source.index());
+    return MinimorphicLoadPropertyAccessInfo::Invalid();
+  }
+
+  AccessInfoFactory factory(this, nullptr, zone());
+  MinimorphicLoadPropertyAccessInfo access_info =
+      factory.ComputePropertyAccessInfo(feedback);
+  if (is_concurrent_inlining_) {
+    TRACE(this,
+          "Storing MinimorphicLoadPropertyAccessInfo for " << source.index());
+    minimorphic_property_access_infos_.insert({source.index(), access_info});
+  }
+  return access_info;
+}
+
 BinaryOperationFeedback const& ProcessedFeedback::AsBinaryOperation() const {
   CHECK_EQ(kBinaryOperation, kind());
   return *static_cast<BinaryOperationFeedback const*>(this);
@@ -5208,6 +5338,12 @@ NamedAccessFeedback const& ProcessedFeedback::AsNamedAccess() const {
   return *static_cast<NamedAccessFeedback const*>(this);
 }
 
+MinimorphicLoadPropertyAccessFeedback const&
+ProcessedFeedback::AsMinimorphicPropertyAccess() const {
+  CHECK_EQ(kMinimorphicPropertyAccess, kind());
+  return *static_cast<MinimorphicLoadPropertyAccessFeedback const*>(this);
+}
+
 LiteralFeedback const& ProcessedFeedback::AsLiteral() const {
   CHECK_EQ(kLiteral, kind());
   return *static_cast<LiteralFeedback const*>(this);
@@ -5246,7 +5382,7 @@ BytecodeAnalysis const& JSHeapBroker::GetBytecodeAnalysis(
   }
 
   CHECK_EQ(policy, SerializationPolicy::kSerializeIfNeeded);
-  BytecodeAnalysis* analysis = new (zone()) BytecodeAnalysis(
+  BytecodeAnalysis* analysis = zone()->New<BytecodeAnalysis>(
       bytecode_array, zone(), osr_bailout_id, analyze_liveness);
   DCHECK_EQ(analysis->osr_bailout_id(), osr_bailout_id);
   bytecode_analyses_[bytecode_array_data] = analysis;

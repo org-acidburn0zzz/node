@@ -5,6 +5,7 @@
 #include "src/snapshot/serializer.h"
 
 #include "src/codegen/assembler-inl.h"
+#include "src/common/globals.h"
 #include "src/heap/heap-inl.h"  // For Space::identity().
 #include "src/heap/memory-chunk-inl.h"
 #include "src/heap/read-only-heap.h"
@@ -53,13 +54,14 @@ void Serializer::OutputStatistics(const char* name) {
 
 #ifdef OBJECT_PRINT
   PrintF("  Instance types (count and bytes):\n");
-#define PRINT_INSTANCE_TYPE(Name)                                             \
-  for (int space = 0; space < kNumberOfSpaces; ++space) {                     \
-    if (instance_type_count_[space][Name]) {                                  \
-      PrintF("%10d %10zu  %-10s %s\n", instance_type_count_[space][Name],     \
-             instance_type_size_[space][Name],                                \
-             Heap::GetSpaceName(static_cast<AllocationSpace>(space)), #Name); \
-    }                                                                         \
+#define PRINT_INSTANCE_TYPE(Name)                                          \
+  for (int space = 0; space < kNumberOfSpaces; ++space) {                  \
+    if (instance_type_count_[space][Name]) {                               \
+      PrintF("%10d %10zu  %-10s %s\n", instance_type_count_[space][Name],  \
+             instance_type_size_[space][Name],                             \
+             BaseSpace::GetSpaceName(static_cast<AllocationSpace>(space)), \
+             #Name);                                                       \
+    }                                                                      \
   }
   INSTANCE_TYPE_LIST(PRINT_INSTANCE_TYPE)
 #undef PRINT_INSTANCE_TYPE
@@ -122,13 +124,13 @@ bool Serializer::SerializeHotObject(HeapObject obj) {
   // Encode a reference to a hot object by its index in the working set.
   int index = hot_objects_.Find(obj);
   if (index == HotObjectsList::kNotFound) return false;
-  DCHECK(index >= 0 && index < kNumberOfHotObjects);
+  DCHECK(index >= 0 && index < kHotObjectCount);
   if (FLAG_trace_serializer) {
     PrintF(" Encoding hot object %d:", index);
     obj.ShortPrint();
     PrintF("\n");
   }
-  sink_.Put(kHotObject + index, "HotObject");
+  sink_.Put(HotObject::Encode(index), "HotObject");
   return true;
 }
 
@@ -156,15 +158,26 @@ bool Serializer::SerializeBackReference(HeapObject obj) {
 
     PutAlignmentPrefix(obj);
     SnapshotSpace space = reference.space();
-    sink_.Put(kBackref + static_cast<int>(space), "BackRef");
+    sink_.Put(BackRef::Encode(space), "BackRef");
     PutBackReference(obj, reference);
   }
   return true;
 }
 
+bool Serializer::SerializePendingObject(HeapObject obj) {
+  auto it = forward_refs_per_pending_object_.find(obj);
+  if (it == forward_refs_per_pending_object_.end()) {
+    return false;
+  }
+
+  int forward_ref_id = PutPendingForwardReference();
+  it->second.push_back(forward_ref_id);
+  return true;
+}
+
 bool Serializer::ObjectIsBytecodeHandler(HeapObject obj) const {
   if (!obj.IsCode()) return false;
-  return (Code::cast(obj).kind() == Code::BYTECODE_HANDLER);
+  return (Code::cast(obj).kind() == CodeKind::BYTECODE_HANDLER);
 }
 
 void Serializer::PutRoot(RootIndex root, HeapObject object) {
@@ -178,12 +191,12 @@ void Serializer::PutRoot(RootIndex root, HeapObject object) {
   // Assert that the first 32 root array items are a conscious choice. They are
   // chosen so that the most common ones can be encoded more efficiently.
   STATIC_ASSERT(static_cast<int>(RootIndex::kArgumentsMarker) ==
-                kNumberOfRootArrayConstants - 1);
+                kRootArrayConstantsCount - 1);
 
   // TODO(ulan): Check that it works with young large objects.
-  if (root_index < kNumberOfRootArrayConstants &&
+  if (root_index < kRootArrayConstantsCount &&
       !Heap::InYoungGeneration(object)) {
-    sink_.Put(kRootArrayConstants + root_index, "RootConstant");
+    sink_.Put(RootArrayConstant::Encode(root), "RootConstant");
   } else {
     sink_.Put(kRootArray, "RootSerialization");
     sink_.PutInt(root_index, "root_index");
@@ -199,13 +212,11 @@ void Serializer::PutSmiRoot(FullObjectSlot slot) {
   STATIC_ASSERT(decltype(slot)::kSlotDataSize == kSystemPointerSize);
   static constexpr int bytes_to_output = decltype(slot)::kSlotDataSize;
   static constexpr int size_in_tagged = bytes_to_output >> kTaggedSizeLog2;
-  sink_.PutSection(kFixedRawDataStart + size_in_tagged, "Smi");
+  sink_.Put(FixedRawDataWithSize::Encode(size_in_tagged), "Smi");
 
   Address raw_value = Smi::cast(*slot).ptr();
   const byte* raw_value_as_bytes = reinterpret_cast<const byte*>(&raw_value);
-  for (size_t i = 0; i < bytes_to_output; i++) {
-    sink_.Put(raw_value_as_bytes[i], "Byte");
-  }
+  sink_.PutRaw(raw_value_as_bytes, bytes_to_output, "Bytes");
 }
 
 void Serializer::PutBackReference(HeapObject object,
@@ -248,16 +259,55 @@ int Serializer::PutAlignmentPrefix(HeapObject object) {
 
 void Serializer::PutNextChunk(SnapshotSpace space) {
   sink_.Put(kNextChunk, "NextChunk");
-  sink_.Put(static_cast<int>(space), "NextChunkSpace");
+  sink_.Put(static_cast<byte>(space), "NextChunkSpace");
 }
 
 void Serializer::PutRepeat(int repeat_count) {
   if (repeat_count <= kLastEncodableFixedRepeatCount) {
-    sink_.Put(EncodeFixedRepeat(repeat_count), "FixedRepeat");
+    sink_.Put(FixedRepeatWithCount::Encode(repeat_count), "FixedRepeat");
   } else {
     sink_.Put(kVariableRepeat, "VariableRepeat");
-    sink_.PutInt(EncodeVariableRepeatCount(repeat_count), "repeat count");
+    sink_.PutInt(VariableRepeatCount::Encode(repeat_count), "repeat count");
   }
+}
+
+int Serializer::PutPendingForwardReference() {
+  sink_.Put(kRegisterPendingForwardRef, "RegisterPendingForwardRef");
+  unresolved_forward_refs_++;
+  return next_forward_ref_id_++;
+}
+
+void Serializer::ResolvePendingForwardReference(int forward_reference_id) {
+  sink_.Put(kResolvePendingForwardRef, "ResolvePendingForwardRef");
+  sink_.PutInt(forward_reference_id, "with this index");
+  unresolved_forward_refs_--;
+
+  // If there are no more unresolved forward refs, reset the forward ref id to
+  // zero so that future forward refs compress better.
+  if (unresolved_forward_refs_ == 0) {
+    next_forward_ref_id_ = 0;
+  }
+}
+
+Serializer::PendingObjectReference Serializer::RegisterObjectIsPending(
+    HeapObject obj) {
+  // Add the given object to the pending objects -> forward refs map.
+  auto forward_refs_entry_insertion =
+      forward_refs_per_pending_object_.emplace(obj, std::vector<int>());
+
+  // Make sure the above emplace actually added the object, rather than
+  // overwriting an existing entry.
+  DCHECK(forward_refs_entry_insertion.second);
+
+  // return the iterator into the map as the reference.
+  return forward_refs_entry_insertion.first;
+}
+
+void Serializer::ResolvePendingObject(Serializer::PendingObjectReference ref) {
+  for (int index : ref->second) {
+    ResolvePendingForwardReference(index);
+  }
+  forward_refs_per_pending_object_.erase(ref);
 }
 
 void Serializer::Pad(int padding_offset) {
@@ -298,24 +348,51 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
         CodeNameEvent(object_.address(), sink_->Position(), code_name));
   }
 
-  const int space_number = static_cast<int>(space);
   SerializerReference back_reference;
-  if (space == SnapshotSpace::kLargeObject) {
-    sink_->Put(kNewObject + space_number, "NewLargeObject");
-    sink_->PutInt(size >> kObjectAlignmentBits, "ObjectSizeInWords");
-    CHECK(!object_.IsCode());
-    back_reference = serializer_->allocator()->AllocateLargeObject(size);
-  } else if (space == SnapshotSpace::kMap) {
-    DCHECK_EQ(Map::kSize, size);
-    back_reference = serializer_->allocator()->AllocateMap();
-    sink_->Put(kNewObject + space_number, "NewMap");
-    // This is redundant, but we include it anyways.
-    sink_->PutInt(size >> kObjectAlignmentBits, "ObjectSizeInWords");
+  if (map == object_) {
+    DCHECK_EQ(object_, ReadOnlyRoots(serializer_->isolate()).meta_map());
+    DCHECK_EQ(space, SnapshotSpace::kReadOnlyHeap);
+    sink_->Put(kNewMetaMap, "NewMetaMap");
+
+    DCHECK_EQ(size, Map::kSize);
+    back_reference = serializer_->allocator()->Allocate(space, size);
   } else {
-    int fill = serializer_->PutAlignmentPrefix(object_);
-    back_reference = serializer_->allocator()->Allocate(space, size + fill);
-    sink_->Put(kNewObject + space_number, "NewObject");
+    sink_->Put(NewObject::Encode(space), "NewObject");
+
+    // TODO(leszeks): Skip this when the map has a fixed size.
     sink_->PutInt(size >> kObjectAlignmentBits, "ObjectSizeInWords");
+
+    // Until the space for the object is allocated, it is considered "pending".
+    auto pending_object_ref = serializer_->RegisterObjectIsPending(object_);
+
+    // Serialize map (first word of the object) before anything else, so that
+    // the deserializer can access it when allocating. Make sure that the map
+    // isn't a pending object.
+    DCHECK_EQ(serializer_->forward_refs_per_pending_object_.count(map), 0);
+    DCHECK(map.IsMap());
+    serializer_->SerializeObject(map);
+
+    // Make sure the map serialization didn't accidentally recursively serialize
+    // this object.
+    DCHECK(!serializer_->reference_map()
+                ->LookupReference(reinterpret_cast<void*>(object_.ptr()))
+                .is_valid());
+
+    // Allocate the object after the map is serialized.
+    if (space == SnapshotSpace::kLargeObject) {
+      CHECK(!object_.IsCode());
+      back_reference = serializer_->allocator()->AllocateLargeObject(size);
+    } else if (space == SnapshotSpace::kMap) {
+      back_reference = serializer_->allocator()->AllocateMap();
+      DCHECK_EQ(Map::kSize, size);
+    } else {
+      int fill = serializer_->PutAlignmentPrefix(object_);
+      back_reference = serializer_->allocator()->Allocate(space, size + fill);
+    }
+
+    // Now that the object is allocated, we can resolve pending references to
+    // it.
+    serializer_->ResolvePendingObject(pending_object_ref);
   }
 
 #ifdef OBJECT_PRINT
@@ -327,9 +404,6 @@ void Serializer::ObjectSerializer::SerializePrologue(SnapshotSpace space,
   // Mark this object as already serialized.
   serializer_->reference_map()->Add(reinterpret_cast<void*>(object_.ptr()),
                                     back_reference);
-
-  // Serialize the map (first word of the object).
-  serializer_->SerializeObject(map);
 }
 
 uint32_t Serializer::ObjectSerializer::SerializeBackingStore(
@@ -360,10 +434,10 @@ void Serializer::ObjectSerializer::SerializeJSTypedArray() {
     if (!typed_array.WasDetached()) {
       // Explicitly serialize the backing store now.
       JSArrayBuffer buffer = JSArrayBuffer::cast(typed_array.buffer());
-      CHECK_LE(buffer.byte_length(), Smi::kMaxValue);
-      CHECK_LE(typed_array.byte_offset(), Smi::kMaxValue);
+      // We cannot store byte_length larger than int32 range in the snapshot.
+      CHECK_LE(buffer.byte_length(), std::numeric_limits<int32_t>::max());
       int32_t byte_length = static_cast<int32_t>(buffer.byte_length());
-      int32_t byte_offset = static_cast<int32_t>(typed_array.byte_offset());
+      size_t byte_offset = typed_array.byte_offset();
 
       // We need to calculate the backing store from the data pointer
       // because the ArrayBuffer may already have been serialized.
@@ -382,8 +456,8 @@ void Serializer::ObjectSerializer::SerializeJSTypedArray() {
 void Serializer::ObjectSerializer::SerializeJSArrayBuffer() {
   JSArrayBuffer buffer = JSArrayBuffer::cast(object_);
   void* backing_store = buffer.backing_store();
-  // We cannot store byte_length larger than Smi range in the snapshot.
-  CHECK_LE(buffer.byte_length(), Smi::kMaxValue);
+  // We cannot store byte_length larger than int32 range in the snapshot.
+  CHECK_LE(buffer.byte_length(), std::numeric_limits<int32_t>::max());
   int32_t byte_length = static_cast<int32_t>(buffer.byte_length());
   ArrayBufferExtension* extension = buffer.extension();
 
@@ -463,9 +537,9 @@ void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   sink_->PutInt(bytes_to_output, "length");
 
   // Serialize string header (except for map).
-  uint8_t* string_start = reinterpret_cast<uint8_t*>(string.address());
+  byte* string_start = reinterpret_cast<byte*>(string.address());
   for (int i = HeapObject::kHeaderSize; i < SeqString::kHeaderSize; i++) {
-    sink_->PutSection(string_start[i], "StringHeader");
+    sink_->Put(string_start[i], "StringHeader");
   }
 
   // Serialize string content.
@@ -475,7 +549,8 @@ void Serializer::ObjectSerializer::SerializeExternalStringAsSequentialString() {
   // maybe left-over bytes that need to be padded.
   int padding_size = allocation_size - SeqString::kHeaderSize - content_size;
   DCHECK(0 <= padding_size && padding_size < kObjectAlignment);
-  for (int i = 0; i < padding_size; i++) sink_->PutSection(0, "StringPadding");
+  for (int i = 0; i < padding_size; i++)
+    sink_->Put(static_cast<byte>(0), "StringPadding");
 }
 
 // Clear and later restore the next link in the weak cell or allocation site.
@@ -540,7 +615,7 @@ void Serializer::ObjectSerializer::Serialize() {
 
   if (object_.IsScript()) {
     // Clear cached line ends.
-    Object undefined = ReadOnlyRoots(serializer_->isolate()).undefined_value();
+    Oddball undefined = ReadOnlyRoots(serializer_->isolate()).undefined_value();
     Script::cast(object_).set_line_ends(undefined);
   }
 
@@ -626,8 +701,7 @@ void Serializer::ObjectSerializer::SerializeDeferred() {
   bytes_processed_so_far_ = kTaggedSize;
 
   serializer_->PutAlignmentPrefix(object_);
-  sink_->Put(kNewObject + static_cast<int>(back_reference.space()),
-             "deferred object");
+  sink_->Put(NewObject::Encode(back_reference.space()), "deferred object");
   serializer_->PutBackReference(object_, back_reference);
   sink_->PutInt(size >> kTaggedSizeLog2, "deferred object size");
 
@@ -679,6 +753,12 @@ void Serializer::ObjectSerializer::VisitPointers(HeapObject host,
     HeapObjectReferenceType reference_type;
     while (current < end &&
            (*current)->GetHeapObject(&current_contents, &reference_type)) {
+      if (serializer_->SerializePendingObject(current_contents)) {
+        bytes_processed_so_far_ += kTaggedSize;
+        ++current;
+        continue;
+      }
+
       RootIndex root_index;
       // Compute repeat count and write repeat prefix if applicable.
       // Repeats are not subject to the write barrier so we can only use
@@ -740,9 +820,9 @@ void Serializer::ObjectSerializer::OutputExternalReference(Address target,
     // references verbatim.
     CHECK(serializer_->allow_unknown_external_references_for_testing());
     CHECK(IsAligned(target_size, kObjectAlignment));
-    CHECK_LE(target_size, kNumberOfFixedRawData * kTaggedSize);
+    CHECK_LE(target_size, kFixedRawDataCount * kTaggedSize);
     int size_in_tagged = target_size >> kTaggedSizeLog2;
-    sink_->PutSection(kFixedRawDataStart + size_in_tagged, "FixedRawData");
+    sink_->Put(FixedRawDataWithSize::Encode(size_in_tagged), "FixedRawData");
     sink_->PutRaw(reinterpret_cast<byte*>(&target), target_size, "Bytes");
   } else if (encoded_reference.is_from_api()) {
     if (V8_HEAP_SANDBOX_BOOL && sandboxify) {
@@ -855,9 +935,9 @@ void Serializer::ObjectSerializer::OutputRawData(Address up_to) {
   if (bytes_to_output != 0) {
     DCHECK(to_skip == bytes_to_output);
     if (IsAligned(bytes_to_output, kObjectAlignment) &&
-        bytes_to_output <= kNumberOfFixedRawData * kTaggedSize) {
+        bytes_to_output <= kFixedRawDataCount * kTaggedSize) {
       int size_in_tagged = bytes_to_output >> kTaggedSizeLog2;
-      sink_->PutSection(kFixedRawDataStart + size_in_tagged, "FixedRawData");
+      sink_->Put(FixedRawDataWithSize::Encode(size_in_tagged), "FixedRawData");
     } else {
       sink_->Put(kVariableRawData, "VariableRawData");
       sink_->PutInt(bytes_to_output, "length");
